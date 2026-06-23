@@ -1,0 +1,57 @@
+name: Repost TikTok to Instagram
+
+on:
+  schedule:
+    # Il cron di GitHub è SEMPRE in UTC. Questa finestra (UTC 10–22) copre
+    # le 12:00–24:00 italiane sia con ora solare (CET) che legale (CEST);
+    # il bot poi controlla l'ora ITALIANA esatta ed esegue solo se è dentro
+    # la finestra attiva (gestendo da sé il cambio dell'ora).
+    # Ogni 20 minuti:
+    - cron: "*/20 10-22 * * *"
+  workflow_dispatch: {}        # permette anche l'avvio manuale dal sito GitHub
+
+permissions:
+  contents: write              # serve per ri-salvare state.json nel repo
+
+concurrency:
+  group: repost-bot            # evita esecuzioni sovrapposte
+  cancel-in-progress: false
+
+jobs:
+  repost:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scarica il codice del repo
+        uses: actions/checkout@v4
+
+      - name: Prepara Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Esegui il bot
+        env:
+          TIKHUB_API_KEY: ${{ secrets.TIKHUB_API_KEY }}
+          ZERNIO_API_KEY: ${{ secrets.ZERNIO_API_KEY }}
+          TIKTOK_USERNAME: federico.bora
+          # sec_uid fisso del profilo (non e' un segreto: e' ricavabile dal profilo pubblico)
+          TIKTOK_SEC_UID: MS4wLjABAAAAXYee2G9TfNW-sqFMzlBsj090z8mPy0Du5Vtro20KTollnaZPcixP1WP6ljmoKIQY
+          # Finestra attiva in ora ITALIANA (00:00–12:00 = spento; 12:00–24:00 = acceso)
+          TZ_NAME: Europe/Rome
+          ACTIVE_FROM: "12"
+          ACTIVE_TO: "24"
+          # Gli avvii manuali (Run workflow) ignorano la finestra oraria, così puoi testare quando vuoi
+          IGNORE_ACTIVE_HOURS: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+        run: python repost_bot.py
+
+      - name: Salva lo stato aggiornato nel repo
+        run: |
+          if ! git diff --quiet -- state.json; then
+            git config user.name "repost-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add state.json
+            git commit -m "update state [skip ci]"
+            git push
+          else
+            echo "Stato invariato: niente da salvare."
+          fi
