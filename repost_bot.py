@@ -44,6 +44,26 @@ TIKHUB = "https://api.tikhub.io"
 ZERNIO = "https://zernio.com/api/v1"
 UA = "repost-bot/1.0"
 
+# curl_cffi e' opzionale: se manca, il bot NON si pianta, ripiega sul 720p TikHub.
+try:
+    from curl_cffi import requests as _cffi
+except ImportError:
+    _cffi = None
+
+# tikdownloader.io: via per il 1080p REALE (emula l'app, supera Cloudflare con
+# l'impronta TLS di Chrome). Vedi tikdl_fetch_cffi.py per la genesi.
+TIKDL_HOME = "https://tikdownloader.io/en"
+TIKDL_ENDPOINT = "https://tikdownloader.io/api/ajaxSearch"
+TIKDL_HEADERS = {
+    "accept": "*/*",
+    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "origin": "https://tikdownloader.io",
+    "referer": TIKDL_HOME,
+    "x-requested-with": "XMLHttpRequest",
+}
+_CF_SIGNS = ("just a moment", "challenge-platform", "cf-mitigated",
+             "enable javascript and cookies", "cf_chl_opt")
+
 
 # --------------------------------------------------------------------------- #
 #  HTTP helper                                                                #
@@ -167,6 +187,102 @@ def download_bytes(url):
 
 
 # --------------------------------------------------------------------------- #
+#  tikdownloader.io: 1080p reale via curl_cffi (con fallback al 720p TikHub)   #
+# --------------------------------------------------------------------------- #
+
+import html as _html
+import re as _re
+
+
+def _looks_blocked(status, text):
+    if status in (403, 503):
+        return True
+    low = (text or "")[:4000].lower()
+    return any(s in low for s in _CF_SIGNS)
+
+
+def _tikdl_extract_html(raw):
+    raw = (raw or "").strip()
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            for k in ("data", "result", "html"):
+                if isinstance(obj.get(k), str):
+                    return obj[k]
+    except json.JSONDecodeError:
+        pass
+    return raw
+
+
+def _tikdl_video_urls(blob):
+    s = _html.unescape((blob or "").replace("\\/", "/"))
+    out, seen = [], set()
+    for u in _re.findall(r'https?://[^\s"\'<>\\)]+', s):
+        u = u.rstrip("\\")
+        low = u.lower()
+        if not any(t in low for t in (".mp4", "tiktokcdn", "/video/",
+                                      "mime_type=video", "dl.", "/dl?",
+                                      "rapidcdn", "snapcdn", "tikcdn")):
+            continue
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _looks_like_mp4(data):
+    # un mp4 valido ha il box 'ftyp' nei primi byte; filtra thumbnail e frammenti
+    return bool(data) and b"ftyp" in data[:64]
+
+
+def fetch_1080_tikdownloader(tiktok_url):
+    """Ritorna i BYTES del 1080p via tikdownloader, oppure None se non riesce.
+
+    Sceglie il candidato mp4 valido piu' GRANDE (il 1080p ~112MB straccia il
+    540p ~11MB), senza bisogno di ffprobe. Qualsiasi intoppo -> None (fallback).
+    """
+    if _cffi is None:
+        return None
+    try:
+        s = _cffi.Session(impersonate="chrome")
+        try:
+            s.get(TIKDL_HOME, timeout=30)
+        except Exception:
+            pass
+        r = s.post(TIKDL_ENDPOINT, data={"q": tiktok_url, "lang": "en"},
+                   headers=TIKDL_HEADERS, timeout=60)
+        if r.status_code != 200 or _looks_blocked(r.status_code, r.text):
+            return None
+        cands = _tikdl_video_urls(_tikdl_extract_html(r.text))
+        best = None
+        for u in cands[:6]:
+            try:
+                data = s.get(u, timeout=300).content
+            except Exception:
+                continue
+            if not _looks_like_mp4(data):
+                continue
+            if best is None or len(data) > len(best):
+                best = data
+        if best and len(best) > 3_000_000:   # >3MB = e' il video vero, non un frammento
+            return best
+        return None
+    except Exception:
+        return None
+
+
+def download_best_bytes(tiktok_url, aweme_id, tikhub_key, allow_hd=True):
+    """Prima il 1080p (tikdownloader); se fallisce, il 720p nativo di TikHub."""
+    if allow_hd:
+        data = fetch_1080_tikdownloader(tiktok_url)
+        if data:
+            return data, "1080p tikdownloader"
+        print("   ⚠ HD non disponibile (Cloudflare/curl_cffi) → ripiego sul 720p TikHub")
+    url = tikhub_best_video_url(tikhub_key, aweme_id)
+    return download_bytes(url), "720p TikHub"
+
+
+# --------------------------------------------------------------------------- #
 #  Zernio: carica + pubblica                                                   #
 # --------------------------------------------------------------------------- #
 
@@ -255,6 +371,9 @@ def main():
     ap.add_argument("--max-new", type=int, default=3, help="max pubblicazioni per esecuzione")
     ap.add_argument("--dry-run", action="store_true", help="mostra cosa farebbe, senza pubblicare")
     ap.add_argument("--seed", action="store_true", help="forza la semina dello stato senza pubblicare")
+    ap.add_argument("--no-hd", action="store_true",
+                    default=os.environ.get("NO_HD", "").lower() in ("1", "true", "yes"),
+                    help="salta il 1080p tikdownloader e usa direttamente il 720p TikHub")
     ap.add_argument("--tz", default=os.environ.get("TZ_NAME", "Europe/Rome"),
                     help="fuso orario per la finestra attiva (default: Europe/Rome)")
     ap.add_argument("--active-from", type=int,
@@ -340,10 +459,11 @@ def main():
             vid, caption = v["id"], v["desc"]
             print(f"\n→ {vid}  «{caption[:45]}»")
             try:
-                url = tikhub_best_video_url(args.tikhub_key, vid)
+                tiktok_url = f"https://www.tiktok.com/@{args.username}/video/{vid}"
                 print("   scarico…")
-                blob = download_bytes(url)
-                print(f"   {len(blob)/1_000_000:.1f} MB → carico su Zernio…")
+                blob, source = download_best_bytes(
+                    tiktok_url, vid, args.tikhub_key, allow_hd=not args.no_hd)
+                print(f"   [{source}] {len(blob)/1_000_000:.1f} MB → carico su Zernio…")
                 public = zernio_upload(args.zernio_key, blob, f"{vid}.mp4")
                 post_id = zernio_post(args.zernio_key, public, caption, ig_account)
                 print(f"   ✅ pubblicato (post {post_id})")
