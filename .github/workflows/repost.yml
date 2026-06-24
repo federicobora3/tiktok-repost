@@ -27,7 +27,10 @@ jobs:
       - name: Prepara Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
+
+      - name: Installa le dipendenze (curl_cffi per il download HD 1080p)
+        run: pip install --upgrade curl_cffi
 
       - name: Esegui il bot
         env:
