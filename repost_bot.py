@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 repost_bot.py — Orchestratore: rileva i nuovi video di un profilo TikTok,
-li scarica (TikHub) e li ripubblica su Instagram (Zernio), tenendo memoria
-di cosa ha gia' fatto per non ripubblicare due volte.
+li scarica (TikHub/tikdownloader) e li ripubblica su Instagram e YouTube
+(Zernio), tenendo memoria per-piattaforma di cosa ha gia' fatto per non
+ripubblicare due volte.
 
 Pensato per girare anche su GitHub Actions (cloud, PC spento).
 
@@ -43,6 +44,10 @@ except ImportError:
 TIKHUB = "https://api.tikhub.io"
 ZERNIO = "https://zernio.com/api/v1"
 UA = "repost-bot/1.0"
+
+# Piattaforme di destinazione. Per aggiungerne una in futuro basta metterla qui:
+# viene integrata automaticamente nello stato e nel ciclo di pubblicazione.
+TARGETS = ("instagram", "youtube")
 
 # curl_cffi e' opzionale: se manca, il bot NON si pianta, ripiega sul 720p TikHub.
 try:
@@ -286,13 +291,16 @@ def download_best_bytes(tiktok_url, aweme_id, tikhub_key, allow_hd=True):
 #  Zernio: carica + pubblica                                                   #
 # --------------------------------------------------------------------------- #
 
-def zernio_ig_account(key):
+def zernio_account(key, platform):
+    """Risolve dinamicamente l'accountId Zernio per la piattaforma indicata
+    ('instagram', 'youtube', ...). Niente da hardcodare: lo legge da Zernio,
+    quindi non serve nessun nuovo secret per l'account YouTube."""
     data = get_json(f"{ZERNIO}/accounts", key)
     accounts = deep_find(data, ("accounts",)) or (data if isinstance(data, list) else [])
     for a in accounts:
-        if isinstance(a, dict) and (a.get("platform") or "").lower() == "instagram":
+        if isinstance(a, dict) and (a.get("platform") or "").lower() == platform:
             return a.get("accountId") or a.get("_id") or a.get("id")
-    raise RuntimeError("Nessun account Instagram collegato su Zernio.")
+    raise RuntimeError(f"Nessun account {platform} collegato su Zernio.")
 
 
 def zernio_upload(key, video_bytes, filename):
@@ -309,11 +317,36 @@ def zernio_upload(key, video_bytes, filename):
     return public_url
 
 
-def zernio_post(key, public_url, caption, account_id):
+def yt_title(caption):
+    """YouTube ESIGE un titolo (Instagram no). Prendo la prima riga non vuota
+    della caption, ripulita e a max 100 caratteri; se vuota, fallback neutro."""
+    for line in (caption or "").splitlines():
+        line = line.strip().replace("<", "").replace(">", "")
+        if line:
+            return line[:100]
+    return "Video"
+
+
+def zernio_post(key, public_url, caption, account_id, platform="instagram", title=None):
+    plat = {"platform": platform, "accountId": account_id}
+    if platform == "youtube":
+        desc = caption or ""
+        if "#shorts" not in desc.lower():            # piccola spinta alla feed Shorts
+            desc = (desc + "\n\n#Shorts").strip()
+        plat["platformSpecificData"] = {
+            "title": title or yt_title(caption),
+            "description": desc,
+            # Zernio documenta 'privacyStatus' (public|unlisted|private). Includo
+            # anche 'visibility' come rete di sicurezza: gli extra vengono ignorati.
+            # Se mai YouTube rifiutasse, è QUI l'unico punto da ritoccare.
+            "privacyStatus": "public",
+            "visibility": "public",
+            "madeForKids": False,
+        }
     payload = {
         "content": caption,
         "mediaItems": [{"type": "video", "url": public_url}],
-        "platforms": [{"platform": "instagram", "accountId": account_id}],
+        "platforms": [plat],
         "publishNow": True,
     }
     res = post_json(f"{ZERNIO}/posts", key, payload)
@@ -340,19 +373,38 @@ def within_active_hours(tz_name, h_from, h_to):
     return _is_active_hour(now.hour, h_from, h_to), now.strftime("%H:%M")
 
 
+def _empty_state():
+    return {p: set() for p in TARGETS}
+
+
 def load_state(path):
+    """Stato per-piattaforma: {'instagram': {..id..}, 'youtube': {..id..}}.
+
+    Migra DA SOLO il vecchio formato {'posted': [...]} (solo IG): quegli id
+    vengono considerati 'gia' fatti' su TUTTE le piattaforme, cosi' aggiungere
+    YouTube NON riversa la cronologia sul canale nuovo — solo i video nuovi.
+    """
     if not os.path.exists(path):
         return None                      # None = primo avvio
     try:
         with open(path) as f:
-            return set(json.load(f).get("posted", []))
+            raw = json.load(f)
     except Exception:
-        return set()
+        return _empty_state()
+    state = _empty_state()
+    if isinstance(raw, dict) and "posted" in raw and not any(p in raw for p in TARGETS):
+        seen = set(raw.get("posted", []))            # vecchio formato → migrazione
+        for p in TARGETS:
+            state[p] = set(seen)
+    else:                                            # formato nuovo
+        for p in TARGETS:
+            state[p] = set((raw or {}).get(p, []))
+    return state
 
 
-def save_state(path, posted):
+def save_state(path, state):
     with open(path, "w") as f:
-        json.dump({"posted": sorted(posted)}, f, indent=2)
+        json.dump({p: sorted(state.get(p, ())) for p in TARGETS}, f, indent=2)
 
 
 # --------------------------------------------------------------------------- #
@@ -371,6 +423,9 @@ def main():
     ap.add_argument("--max-new", type=int, default=3, help="max pubblicazioni per esecuzione")
     ap.add_argument("--dry-run", action="store_true", help="mostra cosa farebbe, senza pubblicare")
     ap.add_argument("--seed", action="store_true", help="forza la semina dello stato senza pubblicare")
+    ap.add_argument("--backfill-youtube", type=int, default=0, metavar="N",
+                    help="UNA TANTUM (avvio manuale): ripubblica su YouTube gli ultimi N "
+                         "video gia' su IG, per popolare il canale nuovo. Default 0 = nessuno.")
     ap.add_argument("--no-hd", action="store_true",
                     default=os.environ.get("NO_HD", "").lower() in ("1", "true", "yes"),
                     help="salta il 1080p tikdownloader e usa direttamente il 720p TikHub")
@@ -416,48 +471,63 @@ def main():
         state = load_state(args.state)
         first_run = state is None
         if first_run:
-            state = set()
+            state = _empty_state()
 
-        # Primo avvio o --seed: registra tutto come "gia' visto", non pubblica.
+        # Primo avvio o --seed: segna tutto come "gia' fatto" su TUTTE le
+        # piattaforme, senza pubblicare nulla.
         if first_run or args.seed:
             if args.dry_run:
-                print(f"\n[DRY-RUN] Primo avvio: seminerei {len(recent)} video come "
-                      f"gia' visti e pubblicherei 0 (nessuna scrittura).")
+                print(f"\n[DRY-RUN] Primo avvio: seminerei {len(recent)} video su "
+                      f"{list(TARGETS)} e pubblicherei 0 (nessuna scrittura).")
                 return
             for v in recent:
-                state.add(v["id"])
+                for p in TARGETS:
+                    state[p].add(v["id"])
             save_state(args.state, state)
-            print(f"\n🌱 Semina completata: {len(state)} video segnati come gia' visti, "
-                  f"0 pubblicati.\n   Da ora in poi pubblichero' solo i NUOVI video.")
+            print(f"\n🌱 Semina completata: {len(recent)} video segnati come gia' fatti "
+                  f"su {list(TARGETS)}, 0 pubblicati.\n   Da ora pubblichero' solo i NUOVI.")
             return
 
-        # Nuovi = id non ancora nello stato. Ordine cronologico (id crescente).
-        new = [v for v in recent if v["id"] not in state]
-        new.sort(key=lambda v: int(v["id"]))
-        print(f"• Video nuovi da pubblicare: {len(new)}")
+        # Backfill una-tantum su YouTube: "dimentica" gli ultimi N su YT cosi'
+        # vengono ripubblicati per popolare il canale nuovo (IG resta intatto).
+        if args.backfill_youtube > 0:
+            latest = sorted((v["id"] for v in recent), key=int, reverse=True)[:args.backfill_youtube]
+            for vid in latest:
+                state["youtube"].discard(vid)
+            print(f"• Backfill YouTube: {len(latest)} video rimessi in coda per il canale.")
 
-        if not new:
+        # Per ogni video, quali piattaforme mancano ancora.
+        def missing(vid):
+            return [p for p in TARGETS if vid not in state[p]]
+
+        todo = [v for v in recent if missing(v["id"])]
+        todo.sort(key=lambda v: int(v["id"]))        # ordine cronologico (id crescente)
+        print(f"• Video con almeno una piattaforma da fare: {len(todo)}")
+
+        if not todo:
             print("\n✅ Niente di nuovo. Tutto a posto.")
             return
 
-        if len(new) > args.max_new:
-            print(f"⚠️  Trovati {len(new)} nuovi, ma ne pubblico al massimo {args.max_new} "
+        if len(todo) > args.max_new:
+            print(f"⚠️  Trovati {len(todo)}, ma ne lavoro al massimo {args.max_new} "
                   f"per sicurezza (i restanti al prossimo giro).")
-            new = new[:args.max_new]
+            todo = todo[:args.max_new]
 
         if args.dry_run:
-            print("\n[DRY-RUN] Pubblicherei questi (nessuna azione reale):")
-            for v in new:
-                print(f"   {v['id']}  {v['desc'][:60]}")
+            print("\n[DRY-RUN] Lavorerei questi (nessuna azione reale):")
+            for v in todo:
+                print(f"   {v['id']}  → {', '.join(missing(v['id']))}  {v['desc'][:50]}")
             return
 
-        ig_account = zernio_ig_account(args.zernio_key)
-        print(f"• Account IG su Zernio: {ig_account}")
+        accounts = {p: zernio_account(args.zernio_key, p) for p in TARGETS}
+        print("• Account Zernio: " + ", ".join(f"{p}={accounts[p]}" for p in TARGETS))
 
         published = 0
-        for v in new:
+        for v in todo:
             vid, caption = v["id"], v["desc"]
-            print(f"\n→ {vid}  «{caption[:45]}»")
+            targets = missing(vid)
+            print(f"\n→ {vid}  «{caption[:45]}»  manca: {', '.join(targets)}")
+            # Scarico + carico UNA VOLTA SOLA: lo stesso publicUrl serve IG e YT.
             try:
                 tiktok_url = f"https://www.tiktok.com/@{args.username}/video/{vid}"
                 print("   scarico…")
@@ -465,15 +535,25 @@ def main():
                     tiktok_url, vid, args.tikhub_key, allow_hd=not args.no_hd)
                 print(f"   [{source}] {len(blob)/1_000_000:.1f} MB → carico su Zernio…")
                 public = zernio_upload(args.zernio_key, blob, f"{vid}.mp4")
-                post_id = zernio_post(args.zernio_key, public, caption, ig_account)
-                print(f"   ✅ pubblicato (post {post_id})")
-                state.add(vid)
-                save_state(args.state, state)     # salva subito dopo ogni successo
-                published += 1
             except Exception as e:
-                print(f"   ❌ errore su {vid}: {e}\n   (riprovero' al prossimo giro)")
+                print(f"   ❌ download/upload fallito: {e}\n   (riprovo al prossimo giro)")
+                continue
 
-        print(f"\n🏁 Fatto: {published} pubblicati, stato aggiornato.")
+            # Pubblico su ogni piattaforma mancante in modo indipendente: se una
+            # fallisce, l'altra va comunque e quella fallita si riprova al giro dopo.
+            for p in targets:
+                try:
+                    title = yt_title(caption) if p == "youtube" else None
+                    post_id = zernio_post(args.zernio_key, public, caption,
+                                          accounts[p], platform=p, title=title)
+                    print(f"   ✅ {p}: pubblicato (post {post_id})")
+                    state[p].add(vid)
+                    save_state(args.state, state)     # salva subito dopo OGNI successo
+                    published += 1
+                except Exception as e:
+                    print(f"   ❌ {p}: {e}\n   (riprovo al prossimo giro)")
+
+        print(f"\n🏁 Fatto: {published} pubblicazioni totali, stato aggiornato.")
 
     except Exception as e:
         print(f"\n❌ Errore: {e}", file=sys.stderr)
