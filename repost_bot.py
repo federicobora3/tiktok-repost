@@ -135,13 +135,20 @@ def tikhub_sec_uid(key, username):
 
 
 def tikhub_recent(key, sec_uid, count):
-    url = (f"{TIKHUB}/api/v1/tiktok/web/fetch_user_post"
-           f"?secUid={urllib.parse.quote(sec_uid)}&cursor=0&count={count}")
+    # Elenco post via endpoint app V3: piu' stabile dello scraping web.
+    # L'endpoint web/fetch_user_post restituisce 400 in modo intermittente;
+    # app/v3/fetch_user_post_videos accetta sec_user_id e ritorna aweme_list.
+    url = (f"{TIKHUB}/api/v1/tiktok/app/v3/fetch_user_post_videos"
+           f"?sec_user_id={urllib.parse.quote(sec_uid)}"
+           f"&max_cursor=0&count={count}&sort_type=0")
     data = get_json(url, key)
-    items = deep_find(data, ("itemList",)) or []
+    # aweme_list = formato app; itemList = formato web (fallback difensivo)
+    items = deep_find(data, ("aweme_list",)) or deep_find(data, ("itemList",)) or []
     out = []
     for it in items:
-        vid = it.get("id") or it.get("aweme_id")
+        if not isinstance(it, dict):
+            continue
+        vid = it.get("aweme_id") or it.get("id")
         desc = it.get("desc") or ""
         if vid:
             out.append({"id": str(vid), "desc": desc})
